@@ -1,0 +1,231 @@
+diff --git a/fs/Kconfig b/fs/Kconfig
+index c229f82..515f76d 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -4,6 +4,12 @@
+ 
+ menu "File systems"
+ 
++config DCACHE_NO_RCU
++	def_bool y
++
++config ICACHE_NO_RCU
++	def_bool y
++
+ # Use unaligned word dcache accesses
+ config DCACHE_WORD_ACCESS
+        bool
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 87bdb53..27456e9 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -233,12 +233,15 @@ static void d_free(struct dentry *dentry)
+ 	this_cpu_dec(nr_dentry);
+ 	if (dentry->d_op && dentry->d_op->d_release)
+ 		dentry->d_op->d_release(dentry);
+-
++#ifdef CONFIG_DCACHE_NO_RCU
+ 	/* if dentry was never visible to RCU, immediate free is OK */
+ 	if (!(dentry->d_flags & DCACHE_RCUACCESS))
+ 		__d_free(&dentry->d_u.d_rcu);
+ 	else
+ 		call_rcu(&dentry->d_u.d_rcu, __d_free);
++#else
++	__d_free(&dentry->d_u.d_rcu);
++#endif
+ }
+ 
+ /**
+@@ -1243,6 +1246,12 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ 	if (!dentry)
+ 		return NULL;
+ 
++#ifdef CONFIG_DCACHE_NO_RCU
++	/* Make sure that any current lookup
++	 * will be aware of this dentry's changes */
++	write_seqcount_barrier(&dentry->d_seq);
++#endif
++
+ 	/*
+ 	 * We guarantee that the inline name is always NUL-terminated.
+ 	 * This way the memcpy() done by the name switching in rename
+@@ -1272,7 +1281,9 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ 	dentry->d_count = 1;
+ 	dentry->d_flags = 0;
+ 	spin_lock_init(&dentry->d_lock);
++#ifdef CONFIG_DCACHE_NO_RCU
+ 	seqcount_init(&dentry->d_seq);
++#endif
+ 	dentry->d_inode = NULL;
+ 	dentry->d_parent = dentry;
+ 	dentry->d_sb = sb;
+@@ -3029,6 +3040,9 @@ static void __init dcache_init(void)
+ 	 * of the dcache. 
+ 	 */
+ 	dentry_cache = KMEM_CACHE(dentry,
++#ifdef CONFIG_DCACHE_NO_RCU
++		SLAB_DESTROY_BY_RCU|
++#endif
+ 		SLAB_RECLAIM_ACCOUNT|SLAB_PANIC|SLAB_MEM_SPREAD);
+ 
+ 	/* Hash may have been set up in dcache_init_early */
+diff --git a/fs/inode.c b/fs/inode.c
+index d6dfb09..e62fb56 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -127,11 +127,20 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	static const struct file_operations empty_fops;
+ 	struct address_space *const mapping = &inode->i_data;
+ 
++
+ 	inode->i_sb = sb;
+ 	inode->i_blkbits = sb->s_blocksize_bits;
++#ifdef CONFIG_ICACHE_NO_RCU
++	spin_lock(&inode->i_lock);
++#else
++	spin_lock_init(&inode->i_lock);
++#endif
++	inode->i_op = &empty_iops;
+ 	inode->i_flags = 0;
++#ifdef CONFIG_ICACHE_NO_RCU
++	spin_unlock(&inode->i_lock);
++#endif
+ 	atomic_set(&inode->i_count, 1);
+-	inode->i_op = &empty_iops;
+ 	inode->i_fop = &empty_fops;
+ 	inode->__i_nlink = 1;
+ 	inode->i_opflags = 0;
+@@ -153,7 +162,6 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 
+ 	if (security_inode_alloc(inode))
+ 		goto out;
+-	spin_lock_init(&inode->i_lock);
+ 	lockdep_set_class(&inode->i_lock, &sb->s_type->i_lock_key);
+ 
+ 	mutex_init(&inode->i_mutex);
+@@ -248,20 +256,27 @@ void __destroy_inode(struct inode *inode)
+ }
+ EXPORT_SYMBOL(__destroy_inode);
+ 
++#ifndef CONFIG_ICACHE_NO_RCU
+ static void i_callback(struct rcu_head *head)
+ {
+ 	struct inode *inode = container_of(head, struct inode, i_rcu);
+ 	kmem_cache_free(inode_cachep, inode);
+ }
++#endif
+ 
+ static void destroy_inode(struct inode *inode)
+ {
+ 	BUG_ON(!list_empty(&inode->i_lru));
+ 	__destroy_inode(inode);
++
+ 	if (inode->i_sb->s_op->destroy_inode)
+ 		inode->i_sb->s_op->destroy_inode(inode);
+ 	else
++#ifdef CONFIG_ICACHE_NO_RCU
++		kmem_cache_free(inode_cachep, inode);
++#else
+ 		call_rcu(&inode->i_rcu, i_callback);
++#endif
+ }
+ 
+ /**
+@@ -1773,7 +1788,7 @@ void __init inode_init(void)
+ 					 sizeof(struct inode),
+ 					 0,
+ 					 (SLAB_RECLAIM_ACCOUNT|SLAB_PANIC|
+-					 SLAB_MEM_SPREAD),
++					 SLAB_DESTROY_BY_RCU|SLAB_MEM_SPREAD),
+ 					 init_once);
+ 
+ 	/* Hash may have been set up in inode_init_early */
+diff --git a/fs/namei.c b/fs/namei.c
+index 89a612e..c3f12d3 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -362,7 +362,11 @@ static inline int do_inode_permission(struct inode *inode, int mask)
+ 
+ 		/* This gets set once for the inode lifetime */
+ 		spin_lock(&inode->i_lock);
+-		inode->i_opflags |= IOP_FASTPERM;
++#ifdef CONFIG_ICACHE_NO_RCU
++		/* Recheck after lock taken */
++		if (likely(!inode->i_op->permission))
++#endif
++			inode->i_opflags |= IOP_FASTPERM;
+ 		spin_unlock(&inode->i_lock);
+ 	}
+ 	return generic_permission(inode, mask);
+@@ -1361,6 +1365,7 @@ static int lookup_fast(struct nameidata *nd,
+ 		 * the dentry name information from lookup.
+ 		 */
+ 		*inode = dentry->d_inode;
++		/*FIXME : igc = (*inode)->gc; */
+ 		if (read_seqcount_retry(&dentry->d_seq, seq))
+ 			return -ECHILD;
+ 
+@@ -1374,6 +1379,7 @@ static int lookup_fast(struct nameidata *nd,
+ 		if (__read_seqcount_retry(&parent->d_seq, nd->seq))
+ 			return -ECHILD;
+ 		nd->seq = seq;
++		/*FIXME : nd->inode_gc = igc; */
+ 
+ 		if (unlikely(dentry->d_flags & DCACHE_OP_REVALIDATE)) {
+ 			status = d_revalidate(dentry, nd->flags);
+@@ -1505,7 +1511,11 @@ static inline int should_follow_link(struct inode *inode, int follow)
+ 
+ 		/* This gets set once for the inode lifetime */
+ 		spin_lock(&inode->i_lock);
+-		inode->i_opflags |= IOP_NOFOLLOW;
++#ifdef CONFIG_ICACHE_NO_RCU
++		/* Recheck after lock taken */
++		if (likely(!inode->i_op->follow_link))
++#endif
++			inode->i_opflags |= IOP_NOFOLLOW;
+ 		spin_unlock(&inode->i_lock);
+ 	}
+ 	return 0;
+@@ -1611,7 +1621,11 @@ static inline int can_lookup(struct inode *inode)
+ 
+ 	/* We do this once for the lifetime of the inode */
+ 	spin_lock(&inode->i_lock);
+-	inode->i_opflags |= IOP_LOOKUP;
++#ifdef CONFIG_ICACHE_NO_RCU
++	/* Recheck after lock taken */
++	if (likely(inode->i_op->lookup))
++#endif
++		inode->i_opflags |= IOP_LOOKUP;
+ 	spin_unlock(&inode->i_lock);
+ 	return 1;
+ }
+@@ -1796,8 +1810,18 @@ static int link_path_walk(const char *name, struct nameidata *nd)
+ 		nd->last = this;
+ 		nd->last_type = type;
+ 
+-		if (!name[len])
+-			return 0;
++		if (!name[len]) {
++#ifdef CONFIG_ICACHE_NO_RCU
++			/* FIXME : add the inode check here!!? */
++			/* does we need a read barrier... most likely... */
++			if (unlikely(read_seqcount_retry(
++					&nd->path.dentry->d_seq, nd->seq) &&
++				(nd->path.dentry->d_inode != nd->inode)))
++				return -ECHILD;
++			else
++#endif
++				return 0;
++		}
+ 		/*
+ 		 * If it wasn't NUL, we know it was '/'. Skip that
+ 		 * slash, and continue until no more slashes.
+@@ -1974,6 +1998,8 @@ static int path_lookupat(int dfd, const char *name,
+ 	if (!err)
+ 		err = complete_walk(nd);
+ 
++	/* Here we should have a refcount on the dentry du to complete_walk op.
++	 * which implicitly imply a refcount on the inode (?) */
+ 	if (!err && nd->flags & LOOKUP_DIRECTORY) {
+ 		if (!can_lookup(nd->inode)) {
+ 			path_put(&nd->path);
